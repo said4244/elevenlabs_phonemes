@@ -1,0 +1,32 @@
+name: elevenlabs_phonemes
+description: A simple Flutter package for voice assistants using ElevenLabs and phoneme visualization
+version: 0.0.1
+homepage: https://github.com/yourusername/elevenlabs_phonemes
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: ">=3.10.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # LiveKit SDK - supports web, iOS, Android
+  livekit_client: ^2.3.6
+  
+  # Logging
+  logger: ^2.0.2
+  
+  # HTTP for token fetching
+  http: ^1.2.0
+  
+  # WebSocket for TTS streaming
+  web_socket_channel: ^3.0.1
+  
+  # For web-specific features
+  web: ^1.1.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
