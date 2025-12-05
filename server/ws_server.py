@@ -191,11 +191,12 @@ class TTSBroadcaster:
         self._chunk_count = 0
         self._start_time = datetime.now()
         
-        # Create ElevenLabs session
+        # Create ElevenLabs session with optimized settings
         config = StreamConfig(
             voice_id=VOICE_ID,
             model_id=MODEL_ID,
             optimize_streaming_latency=OPTIMIZE_LATENCY,
+            chunk_length_schedule=[50, 150, 300, 300],  # Optimized for low latency
         )
         self._el_session = ElevenLabsStreamingSession(config)
         await self._el_session.start()

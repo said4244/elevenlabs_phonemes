@@ -42,6 +42,7 @@ class StreamConfig:
     similarity_boost: float = 0.75
     output_format: str = "pcm_22050"  # Raw PCM at 22050 Hz
     language_code: str = "ar"  # Arabic language code
+    chunk_length_schedule: list[int] = None  # Will use [50, 150, 300, 300] by default
 
 
 class ElevenLabsStreamer:
@@ -272,19 +273,25 @@ class ElevenLabsStreamingSession:
         if self._finished:
             raise RuntimeError("Session already finished")
         
+        # Smart try_trigger_generation usage:
+        # - Always trigger on first chunk to start audio quickly
+        # - Don't trigger on subsequent chunks unless necessary
+        # - Let ElevenLabs handle scheduling based on chunk_length_schedule
+        use_try_trigger = not self._first_text_sent
+        
         message = {
             "text": text,
-            "try_trigger_generation": True,
+            "try_trigger_generation": use_try_trigger,
         }
         
-        # Include voice settings on first message
+        # Include voice settings and config on first message
         if not self._first_text_sent:
             message["voice_settings"] = {
                 "stability": self.config.stability,
                 "similarity_boost": self.config.similarity_boost,
             }
             message["generation_config"] = {
-                "chunk_length_schedule": [120, 160, 250, 290],
+                "chunk_length_schedule": self.config.chunk_length_schedule,
             }
             message["xi_api_key"] = self.api_key
             self._first_text_sent = True
@@ -402,7 +409,8 @@ async def stream_tts(
     config = StreamConfig(
         voice_id=voice_id, 
         model_id=model_id,
-        language_code=language_code
+        language_code=language_code,
+        chunk_length_schedule=[50, 150, 300, 300]  # Optimized schedule
     )
     streamer = ElevenLabsStreamer(config)
     async for chunk in streamer.stream_text(text):

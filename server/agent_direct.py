@@ -53,12 +53,17 @@ class DirectTTSClient:
     Maintains ONE continuous connection per response.
     """
     
-    def __init__(self, ws_url: str):
+    def __init__(self, ws_url: str, buffer_threshold: int = 50):
         self.ws_url = ws_url
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._connected = False
         self._lock = asyncio.Lock()
+        
+        # Text buffering to prevent overlapping audio
+        self._buffer = ""
+        self._buffer_threshold = buffer_threshold  # Minimum chars before flushing
+        self._first_chunk_sent = False
     
     async def connect(self):
         """Connect to the TTS WebSocket server."""
@@ -82,19 +87,86 @@ class DirectTTSClient:
     
     async def append_text(self, text: str):
         """
-        Append a text chunk to the ongoing TTS stream.
-        This is the key method - we send text piece by piece as LLM generates it.
+        Buffer text and send in larger chunks to prevent overlapping audio.
+        This is the key method - we accumulate tokens and flush at strategic points.
         """
         await self.ensure_connected()
+        
+        # Add text to buffer
+        self._buffer += text
+        logger.debug(f"BUFFER: Added '{text}' -> buffer now: '{self._buffer}' (len={len(self._buffer)})")
+        
+        # Determine if we should flush the buffer
+        should_flush = self._should_flush_buffer()
+        
+        if should_flush:
+            logger.info(f"BUFFER: Flushing buffer with {len(self._buffer)} characters")
+            await self._flush_buffer()
+        else:
+            logger.debug(f"BUFFER: Not flushing yet, waiting for more content")
+    
+    def _should_flush_buffer(self) -> bool:
+        """
+        Determine if buffer should be flushed based on content and length.
+        Strategy: Flush on sentence endings or when buffer gets large enough.
+        """
+        if not self._buffer:
+            return False
+        
+        # Always flush if buffer gets very large (safety)
+        if len(self._buffer) >= self._buffer_threshold * 2:
+            return True
+        
+        # Flush on strong punctuation (sentence endings)
+        if len(self._buffer) >= 10:  # Minimum buffer before checking punctuation
+            # Check for sentence endings
+            if self._buffer.rstrip().endswith(('.', '!', '?', '\u061F', '\u061E')):
+                return True
+            
+            # For Arabic question marks and other punctuation
+            # ؟ is Arabic question mark (U+061F)
+            # ؞ is Arabic triple dot punctuation (U+061E)
+        
+        # Flush when buffer reaches threshold AND we hit a natural break
+        if len(self._buffer) >= self._buffer_threshold:
+            # Look for natural break points near the end
+            recent_text = self._buffer[-20:] if len(self._buffer) > 20 else self._buffer
+            
+            # Flush on commas only if we have enough text
+            if ',' in recent_text or '،' in recent_text:  # Arabic comma ،
+                return True
+            
+            # Flush on space after reaching threshold (word boundary)
+            if self._buffer.endswith(' '):
+                return True
+        
+        return False
+    
+    async def _flush_buffer(self):
+        """
+        Send the current buffer to TTS server with proper formatting.
+        """
+        if not self._buffer.strip():
+            return
+        
+        # Ensure text ends with space as per ElevenLabs docs
+        text_to_send = self._buffer
+        if not text_to_send.endswith(' '):
+            text_to_send += ' '
         
         try:
             await self._ws.send_json({
                 "action": "append_tts",
-                "text": text
+                "text": text_to_send
             })
-            logger.debug(f"Appended TTS text: {text}")
+            logger.debug(f"Flushed TTS buffer ({len(text_to_send)} chars): {text_to_send[:50]}...")
+            
+            # Clear buffer and mark first chunk sent
+            self._buffer = ""
+            self._first_chunk_sent = True
+            
         except Exception as e:
-            logger.error(f"Failed to append text: {e}")
+            logger.error(f"Failed to flush buffer: {e}")
             self._connected = False
             raise
     
@@ -104,10 +176,20 @@ class DirectTTSClient:
             return
         
         try:
+            # Flush any remaining buffer first
+            if self._buffer.strip():
+                await self._flush_buffer()
+            
+            # Then send finish signal
             await self._ws.send_json({
                 "action": "finish_tts"
             })
             logger.info("Sent finish_tts signal")
+            
+            # Reset buffer state for next response
+            self._buffer = ""
+            self._first_chunk_sent = False
+            
         except Exception as e:
             logger.error(f"Failed to send finish signal: {e}")
     
@@ -134,10 +216,10 @@ class DirectStreamingAgent:
     5. Flutter receives audio + alignment data for highlighting
     """
     
-    def __init__(self, room: rtc.Room):
+    def __init__(self, room: rtc.Room, buffer_threshold: int = 80):
         self.room = room
         self.openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-        self.tts_client = DirectTTSClient(TTS_WS_URL)
+        self.tts_client = DirectTTSClient(TTS_WS_URL, buffer_threshold=buffer_threshold)
         self.conversation_history: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
@@ -317,28 +399,19 @@ class DirectStreamingAgent:
                 temperature=0.7,
             )
             
-            # Process stream - buffer tokens and send in chunks
-            buffer = ""
+            # Process stream - send EACH token to TTS immediately
             async for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta.content:
                     token = chunk.choices[0].delta.content
-                    buffer += token
                     full_response += token
                     
-                    # Send to Flutter for highlighting immediately
+                    # Send token to TTS server - builds ONE continuous stream
+                    await self.tts_client.append_text(token)
+                    
+                    # Also send to Flutter for display (text highlighting)
                     await self._publish_event("assistant_text_chunk", {"text": token})
                     
-                    # Buffer for TTS to avoid sending too many small requests
-                    # Send if we hit a punctuation mark or buffer is long enough
-                    if len(buffer) > 20 or any(p in token for p in ".!?,،؛"):
-                        await self.tts_client.append_text(buffer)
-                        logger.debug(f"Streamed chunk: {buffer}")
-                        buffer = ""
-            
-            # Send remaining buffer
-            if buffer:
-                await self.tts_client.append_text(buffer)
-                logger.debug(f"Streamed final chunk: {buffer}")
+                    logger.debug(f"Streamed token: {token}")
             
             logger.info("LLM stream finished, sending finish_tts")
             
